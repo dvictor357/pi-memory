@@ -29,7 +29,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createHash } from "node:crypto";
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -50,6 +50,7 @@ interface ProjectProfile {
 	directoryPattern: string | null;
 	conventions: string[];
 	lastScanned: number; // epoch ms
+	fingerprint?: Record<string, number>;
 }
 
 interface UserProfile {
@@ -64,12 +65,17 @@ interface UserProfile {
 	lastModified: number;
 }
 
-const USER_PATH = join(homedir(), ".pi", "agent", "memory", "user.json");
-const PROJECTS_DIR = join(homedir(), ".pi", "agent", "memory", "projects");
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const USER_PATH = join(AGENT_DIR, "memory", "user.json");
+const PROJECTS_DIR = join(AGENT_DIR, "memory", "projects");
+const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
+
+function cwdHash(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+}
 
 function projectPath(cwd: string): string {
-	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-	return join(PROJECTS_DIR, `${hash}.json`);
+	return join(PROJECTS_DIR, `${cwdHash(cwd)}.json`);
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -86,6 +92,23 @@ function writeJSON(path: string, data: unknown): void {
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 	} catch { /* best-effort */ }
+}
+
+function writeSessionMeta(key: "memory" | "todo" | "quest", cwd: string, data: Record<string, unknown>): void {
+	try {
+		const existing = readJSON<{ cwd?: string; cwdHash?: string; updatedAt?: number; extensions?: Record<string, unknown> }>(SESSION_META_PATH, { extensions: {} });
+		const next = {
+			...existing,
+			cwd,
+			cwdHash: cwdHash(cwd),
+			updatedAt: Date.now(),
+			extensions: {
+				...(existing.extensions ?? {}),
+				[key]: { ...data, updatedAt: Date.now() },
+			},
+		};
+		writeJSON(SESSION_META_PATH, next);
+	} catch { /* best-effort cross-extension metadata */ }
 }
 
 function loadProject(cwd: string): ProjectProfile {
@@ -134,6 +157,36 @@ function saveUser(profile: UserProfile): void {
 
 interface Detector {
 	(cwd: string, pkgJSON: Record<string, any> | null): string | null;
+}
+
+const FINGERPRINT_FILES = [
+	"package.json",
+	"tsconfig.json",
+	"pnpm-lock.yaml",
+	"package-lock.json",
+	join(".git", "HEAD"),
+	"pyproject.toml",
+	"go.mod",
+	"Cargo.toml",
+];
+
+function projectFingerprint(cwd: string): Record<string, number> {
+	const fingerprint: Record<string, number> = {};
+	for (const rel of FINGERPRINT_FILES) {
+		try {
+			const p = join(cwd, rel);
+			if (existsSync(p)) fingerprint[rel] = statSync(p).mtimeMs;
+		} catch { /* ignore missing/inaccessible key files */ }
+	}
+	return fingerprint;
+}
+
+function sameFingerprint(a?: Record<string, number>, b?: Record<string, number>): boolean {
+	if (!a || !b) return false;
+	const aKeys = Object.keys(a).sort();
+	const bKeys = Object.keys(b).sort();
+	if (aKeys.length !== bKeys.length) return false;
+	return aKeys.every((key, idx) => key === bKeys[idx] && a[key] === b[key]);
 }
 
 /** Check if a file or directory exists relative to cwd. */
@@ -416,24 +469,36 @@ function detectDirectoryPattern(cwd: string, _pkg: Record<string, any> | null): 
 	return null;
 }
 
+const commitStyleCache = new Map<string, { value: string | null; expiresAt: number }>();
+
 /** Auto-detect commit style from recent commits. */
 function detectCommitStyle(cwd: string): string | null {
+	const cached = commitStyleCache.get(cwd);
+	if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+	let value: string | null = null;
 	try {
-		const log = execSync("git log --oneline -20 --no-decorator 2>/dev/null", { cwd, encoding: "utf8", timeout: 3000 });
-		const lines = log.trim().split("\n").filter(Boolean);
-		if (lines.length === 0) return null;
-		// Count conventional commit format: type(scope): message
-		const conventional = /^\w+(\s*\(.*?\))?!?:\s/.test(lines[0]);
-		// Count how many match
-		const matchCount = lines.filter(l => /^\w+(\s*\(.*?\))?!?:\s/.test(l)).length;
-		if (matchCount >= lines.length * 0.6) return "conventional";
-		// Check other patterns
-		const imperative = lines.filter(l => /^[A-Z][a-z]/.test(l)).length;
-		if (imperative >= lines.length * 0.6) return "imperative";
-		return "mixed";
-	} catch {
-		return null;
-	}
+		const result = spawnSync("git", ["log", "--oneline", "-20", "--no-decorator"], {
+			cwd,
+			encoding: "utf8",
+			timeout: 2000,
+		});
+		if (!result.error && result.status === 0) {
+			const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
+			const lines = stdout.trim().split("\n").filter(Boolean);
+			if (lines.length > 0) {
+				const matchCount = lines.filter(l => /^\w+(\s*\(.*?\))?!?:\s/.test(l)).length;
+				if (matchCount >= lines.length * 0.6) value = "conventional";
+				else {
+					const imperative = lines.filter(l => /^[A-Z][a-z]/.test(l)).length;
+					value = imperative >= lines.length * 0.6 ? "imperative" : "mixed";
+				}
+			}
+		}
+	} catch { /* git unavailable or timed out */ }
+
+	commitStyleCache.set(cwd, { value, expiresAt: Date.now() + 3_600_000 });
+	return value;
 }
 
 /** Auto-detect indent style from project files. */
@@ -508,6 +573,7 @@ function detectProject(cwd: string): ProjectProfile {
 		directoryPattern: detectDirectoryPattern(cwd, pkg),
 		conventions: [], // filled manually by agent
 		lastScanned: Date.now(),
+		fingerprint: projectFingerprint(cwd),
 	};
 }
 
@@ -529,6 +595,32 @@ function detectUser(cwd: string): Partial<UserProfile> {
 }
 
 // ── System prompt builder ────────────────────────────────────────────────────
+
+function memoryLabel(project: ProjectProfile): string {
+	return project.language ?? project.framework ?? project.name ?? "no project";
+}
+
+function writeMemorySessionMeta(cwd: string, project: ProjectProfile): void {
+	writeSessionMeta("memory", cwd, {
+		name: project.name,
+		language: project.language,
+		framework: project.framework,
+		packageManager: project.packageManager,
+		conventions: project.conventions.length,
+	});
+}
+
+function renderMemoryStatus(ctx: ExtensionContext, project: ProjectProfile): void {
+	try {
+		const theme = (ctx.ui as any).theme;
+		if (!project.language && !project.framework) {
+			ctx.ui.setStatus?.("memory", "");
+			return;
+		}
+		const label = `🧠 ${memoryLabel(project)}`;
+		ctx.ui.setStatus?.("memory", theme?.fg ? theme.fg("accent", label) : label);
+	} catch { /* best-effort UI */ }
+}
 
 function buildPromptBlock(project: ProjectProfile, user: UserProfile): string {
 	const lines: string[] = ["## Profile"];
@@ -585,10 +677,18 @@ export default function (pi: ExtensionAPI) {
 	function getProject(cwd: string): ProjectProfile {
 		if (projectProfile) return projectProfile;
 		const stored = loadProject(cwd);
-		// Auto-detect on first load of the session if never scanned or older than 1h
+		// Auto-detect on first load of the session if never scanned or older than 1h.
+		// If key project files have not changed, refresh the timestamp and skip the
+		// expensive directory walk/count detectors.
 		if (!stored.lastScanned || Date.now() - stored.lastScanned > 3_600_000) {
-			projectProfile = reconcile(cwd, stored);
-			saveProject(cwd, projectProfile);
+			const currentFingerprint = projectFingerprint(cwd);
+			if (sameFingerprint(stored.fingerprint, currentFingerprint)) {
+				projectProfile = { ...stored, lastScanned: Date.now(), fingerprint: currentFingerprint };
+				saveProject(cwd, projectProfile);
+			} else {
+				projectProfile = reconcile(cwd, stored);
+				saveProject(cwd, projectProfile);
+			}
 		} else {
 			projectProfile = stored;
 		}
@@ -608,6 +708,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const project = getProject(ctx.cwd);
 			const user = loadUser();
+			renderMemoryStatus(ctx, project);
+			writeMemorySessionMeta(ctx.cwd, project);
 			return {
 				content: [{ type: "text", text: buildPromptBlock(project, user) }],
 				details: { project, user },
@@ -648,6 +750,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			saveProject(ctx.cwd, project);
+			renderMemoryStatus(ctx, project);
+			writeMemorySessionMeta(ctx.cwd, project);
 
 			const lines = ["Project memory updated."];
 			if (params.convention) lines.push(`Added: ${params.convention}`);
@@ -710,6 +814,8 @@ export default function (pi: ExtensionAPI) {
 		const project = getProject(ctx.cwd);
 		const user = loadUser();
 		const block = buildPromptBlock(project, user);
+		renderMemoryStatus(ctx, project);
+		writeMemorySessionMeta(ctx.cwd, project);
 
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${block}`,
@@ -720,7 +826,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Eager-load project profile on session start so it's ready
-		getProject(ctx.cwd);
+		const project = getProject(ctx.cwd);
+		renderMemoryStatus(ctx, project);
+		writeMemorySessionMeta(ctx.cwd, project);
 		// Auto-detect user preferences from the project
 		const detected = detectUser(ctx.cwd);
 		const user = loadUser();
@@ -749,17 +857,21 @@ export default function (pi: ExtensionAPI) {
 				case "": {
 					const project = getProject(ctx.cwd);
 					const user = loadUser();
+					renderMemoryStatus(ctx, project);
+					writeMemorySessionMeta(ctx.cwd, project);
 					ctx.ui.notify(buildPromptBlock(project, user), "info");
 					return;
 				}
 				case "rescan": {
 					projectProfile = null;
-					const project = getProject(ctx.cwd);
-					// Merge auto-detected into stored, keeping conventions
+					const project = loadProject(ctx.cwd);
+					// Force a full re-detect, then merge auto-detected fields into stored conventions.
 					const fresh = detectProject(ctx.cwd);
 					fresh.conventions = project.conventions;
 					saveProject(ctx.cwd, fresh);
 					projectProfile = fresh;
+					renderMemoryStatus(ctx, fresh);
+					writeMemorySessionMeta(ctx.cwd, fresh);
 					ctx.ui.notify(`Project re-scanned: ${fresh.language ?? "?"} • ${fresh.packageManager ?? "?"} • ${fresh.framework ?? "no framework"}`, "info");
 					return;
 				}
@@ -769,6 +881,8 @@ export default function (pi: ExtensionAPI) {
 					fresh.conventions = [];
 					saveProject(ctx.cwd, fresh);
 					projectProfile = fresh;
+					renderMemoryStatus(ctx, fresh);
+					writeMemorySessionMeta(ctx.cwd, fresh);
 					ctx.ui.notify("Project memory cleared. Auto-detected tech stack preserved.", "info");
 					return;
 				}
@@ -790,6 +904,8 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					saveProject(ctx.cwd, project);
+					renderMemoryStatus(ctx, project);
+					writeMemorySessionMeta(ctx.cwd, project);
 					ctx.ui.notify(`Project ${key} → ${value}`, "info");
 					return;
 				}

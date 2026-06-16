@@ -78,6 +78,17 @@ Conventions: prefers TypeScript over JS
 
 All files are readable JSON — you can edit them by hand too.
 
+## Cross-extension cohesion
+
+pi-memory participates in the [cross-extension cohesion contract](https://github.com/dvictor357/pi-quest/blob/main/docs/cross-extension-cohesion.md) alongside pi-todo and pi-quest.
+
+- **Status bar badge** — `🧠 TypeScript` (or framework name) shown in the footer. Clears when no project is detected.
+- **Fingerprint-accelerated detection** — key-file mtimes are cached; rescans skip the full directory walk when nothing changed. `/memory rescan` forces a fresh scan.
+- **Session meta** — publishes language, framework, package manager, and convention count to `~/.pi/agent/session-meta.json` so other extensions can read project context without scanning disks.
+- **Commit-style detection** uses non-blocking `spawnSync` with a 1-hour cache — never blocks the event loop.
+
+All cross-extension writes are best-effort and wrapped in try/catch.
+
 ## Requirements
 
 - **pi** `>=0.79`

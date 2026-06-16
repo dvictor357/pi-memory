@@ -1,7 +1,7 @@
 {
   "name": "pi-memory",
-  "version": "1.0.0",
-  "description": "Persistent project & user memory for pi — auto-detects tech stack, learns conventions, and injects context so every session starts warm",
+  "version": "1.1.0",
+  "description": "Persistent project & user memory for pi — auto-detects tech stack, learns conventions, and injects context so every session starts warm — enhanced: fingerprint caching, session-meta, status badge, cross-extension cohesion",
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
