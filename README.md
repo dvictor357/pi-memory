@@ -1,5 +1,9 @@
 # pi-memory
 
+> [!WARNING]
+> **Deprecated — this project now lives in [pi-suite](https://github.com/dvictor357/pi-suite).**
+> Development has moved to the consolidated `pi-suite` repository. This repo is archived and read-only; please use pi-suite going forward.
+
 Persistent project & user memory for [pi](https://pi.dev). Auto-detects your tech stack, learns your conventions, and injects context into the system prompt so every new session already knows what project you're in and how you like to work.
 
 New in v1.2.0: structured facts with agent/subagent scoping, memory search & lint, prompt budget caps, faster single-scan detection, and expanded fingerprint cache.
